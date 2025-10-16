@@ -1,0 +1,6 @@
+streamlit
+roboflow
+opencv-python
+numpy
+supervision
+requests
