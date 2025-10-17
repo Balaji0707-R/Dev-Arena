@@ -1,6 +1,5 @@
 streamlit
-roboflow
 opencv-python
-numpy
-supervision
+pillow
 requests
+numpy

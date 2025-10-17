@@ -1,990 +1,442 @@
-"""
-Stylish PPE Compliance Tracker
-Features:
-- Modern UI with CSS
-- `st.camera_input` for browser webcam capture
-- Local YOLO .pt model upload (or fallback to yolov8n)
-- Image and video upload processing
-"""
+# app.py
 import streamlit as st
 import cv2
-import numpy as np
-import tempfile
-import os
-import io
-from PIL import Image
-from ultralytics import YOLO
-
-st.set_page_config(page_title="PPE Compliance Tracker", layout="wide")
-
-_CSS = '''
-<style>
-body { background: linear-gradient(135deg,#0f2027,#203a43,#2c5364); }
-.card { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 16px; }
-.title { font-size:28px; font-weight:700; color:#e6eef3 }
-.muted { color:#bcd6e6 }
-.controls { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px }
-</style>
-'''
-
-st.markdown(_CSS, unsafe_allow_html=True)
-
-
-@st.cache_resource
-def load_yolo_model(path: str = None):
-    """Load a YOLO model. If path is None, load yolov8n."""
-    try:
-        if path and os.path.exists(path):
-            return YOLO(path)
-        return YOLO('yolov8n')
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        return None
-
-
-def predict_frame(model, frame: np.ndarray):
-    try:
-        res = model(frame)[0]
-    except Exception as e:
-        st.warning(f"Inference error: {e}")
-        return frame
-    boxes = getattr(res, 'boxes', None)
-    if boxes is None or len(boxes) == 0:
-        return frame
-    try:
-        xyxy = boxes.xyxy.cpu().numpy()
-        cls = boxes.cls.cpu().numpy().astype(int)
-        confs = boxes.conf.cpu().numpy()
-    except Exception:
-        return frame
-
-    for (x1, y1, x2, y2), c, conf in zip(xyxy, cls, confs):
-        color = (0,255,0) if int(c) == 0 else (255,0,0)
-        cv2.rectangle(frame, (int(x1),int(y1)), (int(x2),int(y2)), color, 2)
-        cv2.putText(frame, f"{int(c)} {conf:.2f}", (int(x1), int(y1)-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-    return frame
-
-
-def process_video_file(path: str, model):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        st.error('Unable to open video file')
-        return
-    stframe = st.empty()
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out = predict_frame(model, frame)
-        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-        stframe.image(rgb, channels='RGB', use_column_width=True)
-    cap.release()
-
-
-def process_image_bytes(image_bytes: bytes, model):
-    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    out = predict_frame(model, frame)
-    rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-    st.image(rgb, use_column_width=True)
-
-
-def main():
-    st.markdown('<div class="title">PPE Compliance Tracker</div>', unsafe_allow_html=True)
-    st.markdown('<div class="muted">Upload a YOLO .pt model or use the default yolov8n</div>', unsafe_allow_html=True)
-
-    with st.sidebar:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        uploaded_model = st.file_uploader('Upload YOLO .pt model (optional)', type=['pt'])
-        if uploaded_model is not None:
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pt')
-            tmp.write(uploaded_model.getbuffer())
-            tmp.flush()
-            tmp.close()
-            model = load_yolo_model(tmp.name)
-        else:
-            model = load_yolo_model(None)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    col1, col2 = st.columns([2,1])
-    with col2:
-        st.markdown('<div class="card controls">', unsafe_allow_html=True)
-        st.write('Input')
-        option = st.radio('Select input', ('Camera (browser)','Upload'))
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col1:
-        if option == 'Camera (browser)':
-            cam = st.camera_input('Use your browser camera')
-            if cam is not None:
-                img_bytes = cam.getvalue()
-                process_image_bytes(img_bytes, model)
-        else:
-            uploaded = st.file_uploader('Upload image or video', type=['jpg','png','mp4'])
-            if uploaded is not None:
-                ext = uploaded.name.split('.')[-1].lower()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.'+ext)
-                tmp.write(uploaded.getbuffer())
-                tmp.flush()
-                tmp.close()
-                if ext in ('jpg','png'):
-                    with open(tmp.name,'rb') as f:
-                        data = f.read()
-                    process_image_bytes(data, model)
-                else:
-                    process_video_file(tmp.name, model)
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-
-
-if __name__ == '__main__':
-    main()
-"""
-PPE Compliance Tracker
-Run with: streamlit run app.py
-
-This app uses the Roboflow hosted detect API to run PPE detection (helmet/vest/no-helmet/no-vest).
-Place your Roboflow API key and model id in the sidebar. The app supports Live Webcam and Upload (image/video).
-"""
-import streamlit as st
-import cv2
-import numpy as np
 import requests
+from PIL import Image
+from io import BytesIO
+import numpy as np
+from collections import Counter
+import threading
 import time
-import tempfile
-import os
-import io
-from PIL import Image
-
-try:
-    from supervision import BoxAnnotator, Detections
-except Exception:
-    BoxAnnotator = None
-    Detections = None
-
-
-st.set_page_config(page_title="PPE Compliance Tracker", layout="wide")
-
-
-_CSS = '''
-<style>
-.stApp { background: linear-gradient(120deg, #0f2027, #203a43, #2c5364); color: #e6eef3 }
-.card { background: rgba(255,255,255,0.03); padding: 18px; border-radius: 12px }
-.title { font-size: 28px; font-weight: 700 }
-</style>
-'''
-
-st.markdown(_CSS, unsafe_allow_html=True)
-
-
-def build_roboflow_url(model_id: str, api_key: str) -> str:
-    model_id = model_id.strip().strip('/')
-    return f"https://detect.roboflow.com/{model_id}?api_key={api_key}"
-
-
-def roboflow_predict_image(frame: np.ndarray, model_url: str, confidence: float = 0.25, timeout: int = 30):
-    ok, buf = cv2.imencode('.jpg', frame)
-    if not ok:
-        return []
-    files = {"file": ('image.jpg', buf.tobytes(), 'image/jpeg')}
-    params = {"confidence": confidence}
-    try:
-        r = requests.post(model_url, params=params, files=files, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        st.warning(f"Roboflow request failed: {e}")
-        return []
-
-    preds = []
-    for p in data.get('predictions', []):
-        x = p.get('x')
-        y = p.get('y')
-        w = p.get('width')
-        h = p.get('height')
-        label = p.get('class') or p.get('label') or p.get('name') or 'object'
-        conf = p.get('confidence', 0)
-        if None in (x, y, w, h):
-            xmin = p.get('x_min') or p.get('xmin')
-            ymin = p.get('y_min') or p.get('ymin')
-            xmax = p.get('x_max') or p.get('xmax')
-            ymax = p.get('y_max') or p.get('ymax')
-            if None not in (xmin, ymin, xmax, ymax):
-                preds.append({'x1': int(xmin), 'y1': int(ymin), 'x2': int(xmax), 'y2': int(ymax), 'class': label, 'confidence': conf})
-            continue
-        x1 = int(x - w/2)
-        y1 = int(y - h/2)
-        x2 = int(x + w/2)
-        y2 = int(y + h/2)
-        preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'class': label, 'confidence': conf})
-    return preds
-
-
-def draw_predictions(frame: np.ndarray, preds: list):
-    if BoxAnnotator is None or Detections is None:
-        for p in preds:
-            cls = p.get('class','')
-            conf = p.get('confidence',0)
-            color = (0,255,0) if 'no' not in cls.lower() else (0,0,255)
-            x1,y1,x2,y2 = p['x1'],p['y1'],p['x2'],p['y2']
-            cv2.rectangle(frame, (x1,y1),(x2,y2), color, 2)
-            cv2.putText(frame, f"{cls} {conf:.2f}", (x1, max(12,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        return frame
-
-    boxes = []
-    scores = []
-    class_ids = []
-    labels = []
-    name_to_id = {}
-    next_id = 0
-    for p in preds:
-        boxes.append([p['x1'], p['y1'], p['x2'], p['y2']])
-        scores.append(float(p.get('confidence',0)))
-        name = p.get('class','')
-        if name not in name_to_id:
-            name_to_id[name] = next_id
-            next_id += 1
-        class_ids.append(name_to_id[name])
-        labels.append(f"{name} {p.get('confidence',0):.2f}")
-
-    detections = Detections.from_xyxy(np.array(boxes), scores=np.array(scores), class_id=np.array(class_ids))
-    box_annotator = BoxAnnotator(thickness=2, text_thickness=1, text_scale=0.5)
-    frame = box_annotator.annotate(scene=frame, detections=detections, labels=labels)
-    return frame
-
-
-def process_video_file(path: str, model_url: str):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        st.error('Unable to open video file')
-        return
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    stframe = st.empty()
-    progress = st.progress(0)
-    frame_no = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_no += 1
-        preds = roboflow_predict_image(frame, model_url)
-        out = draw_predictions(frame, preds)
-        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-        stframe.image(rgb, channels='RGB', use_column_width=True)
-        if total:
-            progress.progress(min(frame_no/total,1.0))
-    cap.release()
-    progress.empty()
-
-
-def process_image_bytes(image_bytes: bytes, model_url: str):
-    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    preds = roboflow_predict_image(frame, model_url)
-    out = draw_predictions(frame, preds)
-    rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-    st.image(rgb, use_column_width=True)
-
-
-def main():
-    st.title('PPE Compliance Tracker')
-    st.markdown('<div class="subtitle">Detect helmets and vests using your Roboflow model</div>', unsafe_allow_html=True)
-
-    with st.sidebar.expander('How to use / Roboflow setup', expanded=True):
-        st.write('Insert your Roboflow API key and model id (example: my-ppe-model/1) below.')
-        st.write('Obtain an inference URL from Roboflow or use API key + model id.')
-        st.markdown('---')
-        st.write('Note: this app uses the Roboflow Hosted Detect endpoint. Ensure your model is deployed for inference.')
-
-    api_key = st.sidebar.text_input('Roboflow API Key', value='')
-    model_id = st.sidebar.text_input('Roboflow Model ID (e.g. ppe-model/1)', value='')
-    model_url = None
-    if api_key and model_id:
-        model_url = build_roboflow_url(model_id, api_key)
-
-    mode = st.radio('Mode', ('Live Webcam Detection','Upload Image/Video'))
-
-    if mode == 'Live Webcam Detection':
-        col1, col2 = st.columns([3,1])
-        with col2:
-            st.write('Webcam Controls')
-            start = st.button('Start Webcam')
-            stop = st.button('Stop Webcam')
-        if start:
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                st.error('Unable to open webcam')
-            else:
-                stframe = col1.empty()
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    preds = roboflow_predict_image(frame, model_url) if model_url else []
-                    out = draw_predictions(frame, preds)
-                    rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-                    stframe.image(rgb, channels='RGB', use_column_width=True)
-                    # break if stop pressed
-                    if stop:
-                        break
-                cap.release()
-
-    else:
-        uploaded = st.file_uploader('Upload image (.jpg/.png) or video (.mp4)', type=['jpg','png','mp4'])
-        if uploaded is not None:
-            if not (api_key and model_id):
-                st.warning('Please enter Roboflow API key and model id in the sidebar')
-            else:
-                ext = uploaded.name.split('.')[-1].lower()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.'+ext)
-                tmp.write(uploaded.getbuffer())
-                tmp.flush()
-                tmp.close()
-                if ext in ('jpg','png'):
-                    with open(tmp.name,'rb') as f:
-                        data = f.read()
-                    process_image_bytes(data, model_url)
-                else:
-                    process_video_file(tmp.name, model_url)
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-
-
-if __name__ == '__main__':
-    main()
-"""
-PPE Compliance Tracker
-Run with: streamlit run app.py
-
-Notes:
-- Insert your Roboflow API key and model id in the sidebar (or environment variables).
-- The app supports Live Webcam Detection and Upload Image/Video.
-"""
-import streamlit as st
-import cv2
-import numpy as np
-import requests
-import time
-import tempfile
-import os
-from PIL import Image
-
-try:
-    from supervision import BoxAnnotator, Detections
-except Exception:
-    BoxAnnotator = None
-    Detections = None
-
-st.set_page_config(page_title="PPE Compliance Tracker", layout="wide")
-
-_CSS = '''
-<style>
-.stApp { background: linear-gradient(120deg, #0f2027, #203a43, #2c5364); color: #e6eef3 }
-.container { background: rgba(255,255,255,0.03); padding: 18px; border-radius: 12px }
-.title { font-size: 28px; font-weight: 700 }
-</style>
-'''
-
-st.markdown(_CSS, unsafe_allow_html=True)
-
-
-def build_roboflow_url(model_id: str, api_key: str):
-    model_id = model_id.strip().strip('/')
-    return f"https://detect.roboflow.com/{model_id}?api_key={api_key}"
-
-
-def roboflow_predict_image(image_bgr: np.ndarray, model_url: str, confidence: float = 0.25, timeout: int = 30):
-    """Send image to Roboflow detect endpoint and return list of boxes."""
-    ok, buf = cv2.imencode('.jpg', image_bgr)
-    if not ok:
-        return []
-    files = {"file": ('image.jpg', buf.tobytes(), 'image/jpeg')}
-    params = {"confidence": confidence}
-    try:
-        r = requests.post(model_url, params=params, files=files, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        st.error(f"Roboflow request failed: {e}")
-        return []
-
-    preds = []
-    for p in data.get('predictions', []):
-        # Roboflow returns center x,y,width,height in pixels for hosted detect
-        x = p.get('x')
-        y = p.get('y')
-        w = p.get('width')
-        h = p.get('height')
-        cls = p.get('class') or p.get('label') or 'object'
-        conf = p.get('confidence', 0)
-        if None in (x, y, w, h):
-            # fallback to xmin/xmax
-            xmin = p.get('x_min') or p.get('xmin')
-            ymin = p.get('y_min') or p.get('ymin')
-            xmax = p.get('x_max') or p.get('xmax')
-            ymax = p.get('y_max') or p.get('ymax')
-            if None not in (xmin, ymin, xmax, ymax):
-                preds.append({'x1': int(xmin), 'y1': int(ymin), 'x2': int(xmax), 'y2': int(ymax), 'class': cls, 'confidence': conf})
-            continue
-        x1 = int(x - w/2)
-        y1 = int(y - h/2)
-        x2 = int(x + w/2)
-        y2 = int(y + h/2)
-        preds.append({'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'class': cls, 'confidence': conf})
-    return preds
-
-
-def draw_predictions(frame_bgr: np.ndarray, preds: list):
-    """Draw boxes and labels. Prefer supervision if available."""
-    if BoxAnnotator is None or Detections is None:
-        # simple opencv drawing
-        for p in preds:
-            cls = p.get('class', '')
-            conf = p.get('confidence', 0)
-            color = (0,255,0) if 'no' not in cls.lower() else (0,0,255)
-            x1,y1,x2,y2 = p['x1'], p['y1'], p['x2'], p['y2']
-            cv2.rectangle(frame_bgr, (x1,y1), (x2,y2), color, 2)
-            cv2.putText(frame_bgr, f"{cls} {conf:.2f}", (x1, max(12,y1-6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        return frame_bgr
-
-    # Build supervision structures
-    boxes = []
-    scores = []
-    class_ids = []
-    labels = []
-    name_to_id = {}
-    next_id = 0
-    for p in preds:
-        boxes.append([p['x1'], p['y1'], p['x2'], p['y2']])
-        scores.append(float(p.get('confidence', 0)))
-        name = p.get('class','')
-        if name not in name_to_id:
-            name_to_id[name] = next_id
-            next_id += 1
-        class_ids.append(name_to_id[name])
-        labels.append(f"{name} {p.get('confidence',0):.2f}")
-
-    detections = Detections.from_xyxy(np.array(boxes), scores=np.array(scores), class_id=np.array(class_ids))
-    box_annotator = BoxAnnotator(thickness=2, text_thickness=1, text_scale=0.5)
-    frame = box_annotator.annotate(scene=frame_bgr, detections=detections, labels=labels)
-    return frame
-
-
-def process_video_file(path: str, model_url: str):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        st.error('Unable to open video file')
-        return
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    stframe = st.empty()
-    progress = st.progress(0)
-    frame_no = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_no += 1
-        preds = roboflow_predict_image(frame, model_url)
-        out = draw_predictions(frame, preds)
-        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-        stframe.image(rgb, channels='RGB', use_column_width=True)
-        if total:
-            progress.progress(min(frame_no/total,1.0))
-    cap.release()
-    progress.empty()
-
-
-def process_image_file(image_bytes: bytes, model_url: str):
-    image = Image.open(tempfile.SpooledTemporaryFile())
-    image = Image.open(tempfile.SpooledTemporaryFile())
-    # safer: read via PIL from bytes
-    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-    preds = roboflow_predict_image(frame, model_url)
-    out = draw_predictions(frame, preds)
-    rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-    st.image(rgb, use_column_width=True)
-
-
-def main():
-    st.title('PPE Compliance Tracker')
-    st.markdown('<div class="subtitle">Detect helmets and vests using your Roboflow model</div>', unsafe_allow_html=True)
-
-    # Sidebar for Roboflow credentials and instructions
-    with st.sidebar.expander('How to use / Roboflow setup', expanded=True):
-        st.write('Insert your Roboflow API key and model id (example: my-ppe-model/1) below.')
-        st.write('You can obtain an inference URL from Roboflow or use the API key + model id.')
-        st.markdown('---')
-        st.write('If you prefer, export your model to a .pt and use the ultralytics path-based loader in a different app variant.')
-
-    api_key = st.sidebar.text_input('Roboflow API Key', value='')
-    model_id = st.sidebar.text_input('Roboflow Model ID (e.g. ppe-model/1)', value='')
-    model_url = None
-    if api_key and model_id:
-        model_url = build_roboflow_url(model_id, api_key)
-
-    mode = st.radio('Mode', ('Live Webcam Detection','Upload Image/Video'))
-
-    if mode == 'Live Webcam Detection':
-        st.write('Starting webcam...')
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error('Unable to open webcam')
-            return
-        stframe = st.empty()
-        stop_button = st.button('Stop')
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            if model_url:
-                preds = roboflow_predict_image(frame, model_url)
-            else:
-                preds = []
-            out = draw_predictions(frame, preds)
-            rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-            stframe.image(rgb, channels='RGB', use_column_width=True)
-            if stop_button:
-                break
-        cap.release()
-
-    else:
-        uploaded = st.file_uploader('Upload image (.jpg/.png) or video (.mp4)', type=['jpg','png','mp4'])
-        if uploaded is not None:
-            if model_url is None:
-                st.warning('Please enter Roboflow API key and model id in the sidebar')
-            else:
-                ext = uploaded.name.split('.')[-1].lower()
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.'+ext)
-                tmp.write(uploaded.getbuffer())
-                tmp.flush()
-                tmp.close()
-                if ext in ('jpg','png'):
-                    with open(tmp.name,'rb') as f:
-                        data = f.read()
-                    process_image_file(data, model_url)
-                else:
-                    process_video_file(tmp.name, model_url)
-                try:
-                    os.remove(tmp.name)
-                except Exception:
-                    pass
-
-
-if __name__ == '__main__':
-    main()
-import logging
-import requests
-import streamlit as st
-import cv2
-import numpy as np
+import matplotlib.pyplot as plt
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import pandas as pd
 import tempfile
 import os
-import time
-from datetime import timedelta
-from ultralytics import YOLO
 
+# ----------------- PAGE CONFIG -----------------
+st.set_page_config(page_title="AI Safety Monitoring System", layout="wide")
+st.title("🦺 AI Safety Monitoring System")
+st.write("This dashboard uses the Roboflow API for real-time Personal Protective Equipment (PPE) detection.")
 
-st.set_page_config(page_title="Safe-Sight AI: Forbidden Zone Detector", layout="wide")
+# ----------------- SIDEBAR CONFIGURATION -----------------
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    st.divider()
+    
+    st.subheader("Roboflow Credentials")
+    ROBoflow_API_KEY = st.text_input("Roboflow API Key", type="password")
+    MODEL_ENDPOINT = st.text_input(
+        "Roboflow Model Endpoint",
+        placeholder="e.g., ppe-detection/1"
+    )
+    # Construct the full URL
+    if ROBoflow_API_KEY and MODEL_ENDPOINT and not MODEL_ENDPOINT.startswith("https://"):
+        MODEL_ENDPOINT = f"https://detect.roboflow.com/{MODEL_ENDPOINT}"
 
+    def validate_credentials(api_key: str, url: str):
+        if not api_key or not url:
+            st.warning("Please enter your API key and Model Endpoint.")
+            return False
+        if not url.startswith("https://detect.roboflow.com/"):
+            st.error("Invalid Model Endpoint format. It should be like 'project_name/version'.")
+            return False
+        return True
 
-@st.cache_resource
-def load_model(path: str = "yolov8n.pt", roboflow_url: str = None, uploaded_model_path: str = None):
-    """Load and cache the YOLO model to avoid reloading between reruns.
+    credentials_valid = validate_credentials(ROBoflow_API_KEY, MODEL_ENDPOINT)
+    
+    st.divider()
+    
+    st.subheader("Detection Settings")
+    confidence_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.45, 0.05)
+    selected_classes_input = st.text_input("Filter classes (comma-separated)", help="Leave blank to detect all classes.")
+    selected_classes = [c.strip() for c in selected_classes_input.split(',') if c.strip()]
+    show_boxes = st.checkbox("Show Bounding Boxes", value=True)
+    
+    st.divider()
 
-    Behavior:
-    - If `path` exists on disk, attempt to load it.
-    - Otherwise, try to load the named model 'yolov8n' which triggers ultralytics to download the weights.
-    """
+    st.subheader("📧 Email Alert Settings")
+    EMAIL_ALERT_ENABLED = st.checkbox("Enable Email Alerts", value=True)
+    EMAIL_SENDER = st.text_input("Sender Email", value="your_email@gmail.com")
+    EMAIL_PASSWORD = st.text_input("Sender App Password", type="password")
+    EMAIL_RECEIVER = st.text_input("Receiver Email", value="authorized_person@example.com")
+    
+    EMAIL_SMTP_SERVER = "smtp.gmail.com"
+    EMAIL_SMTP_PORT = 587
+    
+    def send_email_alert(subject, body):
+        if not EMAIL_ALERT_ENABLED or not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
+            return
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = EMAIL_SENDER
+            msg['To'] = EMAIL_RECEIVER
+            msg['Subject'] = subject
+            msg.attach(MIMEText(body, 'plain'))
+            server = smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT)
+            server.starttls()
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            text = msg.as_string()
+            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, text)
+            server.quit()
+        except Exception as e:
+            st.error(f"Email alert failed: {e}")
+
+    if st.button("Send Test Email"):
+        if EMAIL_SENDER and EMAIL_PASSWORD and EMAIL_RECEIVER:
+            send_email_alert(
+                subject="PPE Email Test",
+                body="This is a test email from your PPE Detection System."
+            )
+            st.success("Test email sent. Check your inbox/spam.")
+        else:
+            st.warning("Please fill in all email fields to send a test email.")
+
+# Stop the app if credentials are not valid
+if not credentials_valid:
+    st.info("Enter valid credentials in the sidebar to begin.")
+    st.stop()
+    
+# ----------------- BACKEND FUNCTIONS (UNCHANGED) -----------------
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+
+def safe_int(val, default=0):
     try:
-        # If an uploaded model path was provided by the user, prefer it
-        if uploaded_model_path and os.path.exists(uploaded_model_path):
-            logging.info(f"Loading YOLO model from uploaded file: {uploaded_model_path}")
-            return YOLO(uploaded_model_path)
+        if val is None or np.isnan(val) or np.isinf(val): return default
+        return int(round(float(val)))
+    except: return default
 
-        # If a Roboflow/remote URL was provided, download it to a temp file and load
-        if roboflow_url:
-            logging.info(f"Downloading model from URL: {roboflow_url}")
-            try:
-                r = requests.get(roboflow_url, stream=True, timeout=60)
-                r.raise_for_status()
-                fd, tmp_path = tempfile.mkstemp(suffix=".pt")
-                os.close(fd)
-                with open(tmp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                logging.info(f"Downloaded model to: {tmp_path}")
-                return YOLO(tmp_path)
-            except Exception as e:
-                logging.exception("Failed to download model from provided URL")
-                raise RuntimeError(f"Failed to download model from provided URL: {e}")
+def is_valid_number(val):
+    return val is not None and not np.isnan(val) and not np.isinf(val)
 
-        # Prefer local file if present
-        if path and os.path.exists(path):
-            logging.info(f"Loading YOLO model from local file: {path}")
-            return YOLO(path)
-
-        # If local file missing, attempt to load by model name so ultralytics will download it
-        logging.info("Local weights not found; attempting to download 'yolov8n' automatically.")
-        st.info("YOLOv8 weights not found locally — downloading weights (this may take a few minutes)...")
-        return YOLO("yolov8n")
+def detect_ppe(frame: np.ndarray, timeout=10):
+    try:
+        img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        buf = BytesIO()
+        pil_img.save(buf, format="JPEG", quality=70)
+        buf.seek(0)
+        response = requests.post(
+            MODEL_ENDPOINT,
+            params={"api_key": ROBoflow_API_KEY},
+            files={"file": buf.getvalue()},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as he:
+        st.error(f"Roboflow HTTP error: {he}")
+    except requests.exceptions.ConnectionError as ce:
+        st.error(f"Network error: Please check your internet connection. Details: {ce}")
+    except requests.exceptions.Timeout:
+        st.warning("Roboflow request timed out.")
     except Exception as e:
-        logging.exception("Failed to load YOLO model")
-        # Re-raise so the caller can present an error
-        raise RuntimeError(f"Failed to load YOLO model: {e}")
+        st.error(f"An unexpected error occurred during detection: {e}")
+    return None
 
+def draw_predictions_on_frame(frame: np.ndarray, predictions: dict):
+    preds_list = []
+    if not predictions or "predictions" not in predictions:
+        return frame, preds_list, []
 
-def format_timestamp(ms: float) -> str:
-    """Convert milliseconds to H:M:S.ms formatted string."""
-    try:
-        td = timedelta(milliseconds=int(ms))
-        return str(td)
-    except Exception:
-        return "0:00:00"
-
-
-def process_video(video_path: str, x_start: int, x_end: int, alerts: list, model: YOLO):
-    """
-    Process video frame-by-frame, run YOLOv8 inference, annotate frames, and collect alerts.
-
-    Yields annotated BGR frames for display. Alerts are appended to the provided `alerts` list
-    as dictionaries: {'frame': int, 'timestamp': str, 'x_center': int, 'confidence': float}.
-    """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        st.error("Unable to open the uploaded video file.")
-        return
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_no = 0
-
-    # Normalize zone coordinates for safety (will be clipped to frame width per-frame)
-    try:
-        x_start = int(x_start)
-        x_end = int(x_end)
-    except Exception:
-        x_start, x_end = 0, 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_no += 1
-        h, w = frame.shape[:2]
-
-        # Clip inputs to frame boundaries
-        xs = max(0, min(w - 1, x_start))
-        xe = max(0, min(w - 1, x_end))
-        if xe < xs:
-            xs, xe = xe, xs
-
-        breach_in_frame = False
-
-        # Run detection on the BGR frame (ultralytics accepts numpy arrays)
+    for pred in predictions.get("predictions", []):
         try:
-            results = model(frame)[0]
-        except Exception as e:
-            # If model fails on a frame, skip and continue
-            st.warning(f"Model inference error on frame {frame_no}: {e}")
-            yield frame
+            cls = str(pred.get("class", "unknown"))
+            conf = pred.get("confidence", 0.0)
+            if not is_valid_number(conf) or conf < confidence_threshold:
+                continue
+            conf = float(conf)
+
+            if selected_classes and cls not in selected_classes:
+                continue
+
+            x_c, y_c, w, h = pred.get("x"), pred.get("y"), pred.get("width"), pred.get("height")
+            if not all(map(is_valid_number, [x_c, y_c, w, h])) or w <= 0 or h <= 0:
+                continue
+            x_c, y_c, w, h = float(x_c), float(y_c), float(w), float(h)
+            
+            x1 = max(0, safe_int(x_c - w/2))
+            y1 = max(0, safe_int(y_c - h/2))
+            x2 = min(safe_int(x_c + w/2), frame.shape[1]-1)
+            y2 = min(safe_int(y_c + h/2), frame.shape[0]-1)
+
+            preds_list.append({"class": cls, "conf": conf, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+            if show_boxes:
+                color = (0, 255, 0) # Green for compliant
+                if "no_" in cls.lower() or "missing" in cls.lower() or "unsafe" in cls.lower():
+                    color = (0, 0, 255) # Red for non-compliant
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, f"{cls} {conf:.2f}", (x1, max(15, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2)
+        except Exception:
             continue
+            
+    classes = [p["class"] for p in preds_list]
+    return frame, preds_list, classes
 
-        boxes = getattr(results, "boxes", None)
-        if boxes is not None and len(boxes) > 0:
-            # Extract arrays: xyxy, class ids, confidences
-            try:
-                xyxy = boxes.xyxy.cpu().numpy()
-                cls = boxes.cls.cpu().numpy().astype(int)
-                confs = boxes.conf.cpu().numpy()
-            except Exception:
-                # Fallback if the Boxes object API differs
-                xyxy, cls, confs = [], [], []
+def compute_person_ppe_stats(preds_list):
+    persons = [p for p in preds_list if p["class"].lower() == "person"]
+    helmets = [p for p in preds_list if "helmet" in p["class"].lower() and not p["class"].lower().startswith("no_")]
+    jackets = [p for p in preds_list if ("jacket" in p["class"].lower() or "safety" in p["class"].lower() or "vest" in p["class"].lower()) and not p["class"].lower().startswith("no_")]
+    no_helmets = [p for p in preds_list if p["class"].lower().startswith("no_") and "helmet" in p["class"].lower()]
+    no_jackets = [p for p in preds_list if p["class"].lower().startswith("no_") and ("jacket" in p["class"].lower() or "vest" in p["class"].lower())]
 
-            for (x1, y1, x2, y2), c, conf in zip(xyxy, cls, confs):
-                # COCO class 0 corresponds to 'person'
-                if int(c) != 0:
-                    continue
-
-                x_center = (float(x1) + float(x2)) / 2.0
-
-                # Check if center falls inside forbidden zone
-                if xs <= x_center <= xe:
-                    breach_in_frame = True
-                    # RED bounding box for breach
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-                    # Log the alert with timestamp from the video capture
-                    ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                    ts = format_timestamp(ms)
-                    alerts.append({
-                        "frame": frame_no,
-                        "timestamp": ts,
-                        "x_center": int(x_center),
-                        "confidence": float(round(float(conf), 3)),
-                    })
-                else:
-                    # GREEN bounding box for safe person
-                    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-
-        # Draw the forbidden zone overlay (red translucent rectangle)
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (xs, 0), (xe, h), (0, 0, 255), -1)
-        alpha = 0.12
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-
-        # Add small HUD: frame number and breach status
-        status_text = f"Frame: {frame_no} | Breach: {'YES' if breach_in_frame else 'NO'}"
-        cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-        yield frame
-
-    cap.release()
-
-
-def find_ppe_class_ids(model: YOLO):
-    """Return lists of class IDs that likely correspond to helmets and safety jackets/vests.
-
-    We perform a fuzzy match on the model's `names` mapping so the app works with custom PPE models
-    that may use labels like 'helmet', 'hardhat', 'safety_vest', 'vest', 'jacket', etc.
-    """
-    helmet_keywords = ("helmet", "hardhat", "hard hat", "hat")
-    jacket_keywords = ("jacket", "vest", "safety_vest", "safety jacket", "safety_jacket", "highvis", "hi-vis", "hi vis")
-    helmet_ids = []
-    jacket_ids = []
-    try:
-        names = getattr(model, "names", None) or {}
-        for cid, name in names.items():
-            lname = str(name).lower()
-            for k in helmet_keywords:
-                if k in lname:
-                    helmet_ids.append(int(cid))
-                    break
-            for k in jacket_keywords:
-                if k in lname:
-                    jacket_ids.append(int(cid))
-                    break
-    except Exception:
-        pass
-    return list(set(helmet_ids)), list(set(jacket_ids))
-
-
-def process_camera(source: int, x_start: int, x_end: int, alerts: list, model: YOLO, mode: str):
-    """
-    Process frames from a camera source (device index) and yield annotated frames.
-
-    mode: 'Forbidden Zone' or 'PPE Detection'
-    """
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        st.error("Unable to access the camera. Check permissions and that the device is available.")
-        return
-
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480)
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640)
-
-    # prepare PPE class ids
-    helmet_ids, jacket_ids = find_ppe_class_ids(model)
-
-    frame_no = 0
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_no += 1
-
-        xs = max(0, min(w - 1, int(x_start)))
-        xe = max(0, min(w - 1, int(x_end)))
-        if xe < xs:
-            xs, xe = xe, xs
-
-        breach_in_frame = False
-
+    # --- This entire function is complex backend logic, so it remains unchanged ---
+    # (The function body is omitted here for brevity but is the same as your original)
+    # ... [Same function body as your original code] ...
+    if not persons and (helmets or jackets or no_helmets or no_jackets):
+        helmet_positions = [(safe_int((h["x1"]+h["x2"])/2), safe_int((h["y1"]+h["y2"])/2)) for h in helmets]
+        vest_positions = [(safe_int((v["x1"]+v["x2"])/2), safe_int((v["y1"]+v["y2"])/2)) for v in jackets]
+        no_helmet_positions = [(safe_int((h["x1"]+h["x2"])/2), safe_int((h["y1"]+h["y2"])/2)) for h in no_helmets]
+        no_vest_positions = [(safe_int((v["x1"]+v["x2"])/2), safe_int((v["y1"]+v["y2"])/2)) for v in no_jackets]
+        matched_persons, used_vests = [], set()
+        for i, (hx, hy) in enumerate(helmet_positions):
+            closest_vest, min_dist = None, float('inf')
+            for j, (vx, vy) in enumerate(vest_positions):
+                if j not in used_vests:
+                    dist = ((hx-vx)**2 + (hy-vy)**2)**0.5
+                    if dist < min_dist and dist < 200: min_dist, closest_vest = dist, j
+            if closest_vest is not None:
+                used_vests.add(closest_vest); matched_persons.append({"has_helmet": True, "has_jacket": True})
+            else: matched_persons.append({"has_helmet": True, "has_jacket": False})
+        for j in range(len(vest_positions)):
+            if j not in used_vests: matched_persons.append({"has_helmet": False, "has_jacket": True})
+        for _ in no_helmet_positions: matched_persons.append({"has_helmet": False, "has_jacket": False})
+        for _ in no_vest_positions: matched_persons.append({"has_helmet": False, "has_jacket": False})
+        total_persons = len(matched_persons)
+        safe_count = sum(1 for p in matched_persons if p["has_helmet"] and p["has_jacket"])
+        return total_persons, safe_count, total_persons - safe_count, matched_persons
+    
+    per_person = []
+    for person in persons:
         try:
-            results = model(frame)[0]
-        except Exception as e:
-            st.warning(f"Model inference error on camera frame {frame_no}: {e}")
-            yield frame
-            continue
+            x1,y1,x2,y2 = safe_int(person["x1"]), safe_int(person["y1"]), safe_int(person["x2"]), safe_int(person["y2"])
+            has_helmet = any(x1<=safe_int((h["x1"]+h["x2"])/2)<=x2 and y1<=safe_int((h["y1"]+h["y2"])/2)<=y2 for h in helmets)
+            has_jacket = any(x1<=safe_int((j["x1"]+j["x2"])/2)<=x2 and y1<=safe_int((j["y1"]+j["y2"])/2)<=y2 for j in jackets)
+            for nh in no_helmets:
+                if x1<=safe_int((nh["x1"]+nh["x2"])/2)<=x2 and y1<=safe_int((nh["y1"]+nh["y2"])/2)<=y2: has_helmet=False
+            for nj in no_jackets:
+                if x1<=safe_int((nj["x1"]+nj["x2"])/2)<=x2 and y1<=safe_int((nj["y1"]+nj["y2"])/2)<=y2: has_jacket=False
+            per_person.append({"person_box":(x1,y1,x2,y2),"has_helmet":has_helmet,"has_jacket":has_jacket})
+        except: continue
+    total_persons = len(per_person)
+    safe_count = sum(1 for p in per_person if p["has_helmet"] and p["has_jacket"])
+    return total_persons, safe_count, total_persons - safe_count, per_person
 
-        boxes = getattr(results, "boxes", None)
-        if boxes is not None and len(boxes) > 0:
+def plot_ppe_pie(stats_dict):
+    labels, sizes = list(stats_dict.keys()), list(stats_dict.values())
+    colors = ['#4CAF50', '#F44336']; fig, ax = plt.subplots(figsize=(4, 4))
+    if not sizes or all(s == 0 for s in sizes):
+        ax.text(0.5, 0.5, 'No Data', ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray'); ax.axis('off')
+    else:
+        ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, colors=colors, wedgeprops=dict(width=0.4, edgecolor='w')); ax.axis('equal')
+    return fig
+
+def convert_to_bytes(frame: np.ndarray):
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)); buf = BytesIO()
+    pil_img.save(buf, format="PNG"); return buf.getvalue()
+
+# ----------------- MAIN PAGE UI -----------------
+tab1, tab2, tab3 = st.tabs(["🖼️ Image Upload", "🎥 Live Webcam Feed", "🎞️ Video Upload"])
+
+# ----------------- IMAGE UPLOAD TAB -----------------
+with tab1:
+    st.header("Upload an Image for PPE Detection")
+    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
+    if uploaded_file:
+        col1, col2 = st.columns([2, 1.2])
+        with col1:
+            st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+            image = Image.open(uploaded_file).convert("RGB"); frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            with st.spinner("🔍 Analyzing image..."): predictions = detect_ppe(frame)
+        with col2:
+            st.subheader("📊 Analysis Results")
+            if predictions:
+                annotated_frame, preds_list, _ = draw_predictions_on_frame(frame.copy(), predictions)
+                col1.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), caption="Annotated Image", use_container_width=True)
+                col1.download_button("Download Annotated Image", data=convert_to_bytes(annotated_frame), file_name="annotated_image.png", mime="image/png")
+                total_persons, safe_count, unsafe_count, per_person_details = compute_person_ppe_stats(preds_list)
+                metric_cols = st.columns(3)
+                metric_cols[0].metric("Total Persons", total_persons, delta_color="off")
+                metric_cols[1].metric("✅ Safe", safe_count)
+                metric_cols[2].metric("❌ Unsafe", unsafe_count, delta=f"-{unsafe_count}" if unsafe_count > 0 else "0")
+                st.divider()
+                st.write("**Safety Compliance Chart**"); fig = plot_ppe_pie({"Safe": safe_count, "Unsafe": unsafe_count}); st.pyplot(fig)
+                st.divider()
+                st.write("**📋 Individual Details**")
+                if per_person_details:
+                    for i, p in enumerate(per_person_details, 1):
+                        helmet, jacket = "✅" if p["has_helmet"] else "❌", "✅" if p["has_jacket"] else "❌"
+                        overall = "✅ SAFE" if (p["has_helmet"] and p["has_jacket"]) else "⚠️ UNSAFE"
+                        st.text(f"Person {i}: Helmet {helmet} | Vest {jacket} → {overall}")
+                else: st.info("No persons detected to analyze individually.")
+            else: st.warning("No predictions could be made.")
+
+# ----------------- LIVE WEBCAM TAB -----------------
+with tab2:
+    st.header("Live Webcam PPE Detection")
+    with st.sidebar:
+        st.divider(); st.subheader("Webcam Settings")
+        DETECT_INTERVAL = st.number_input("Detect every N frames", 1, 60, 6, help="Higher number reduces API calls.")
+        RENDER_SKIP = st.number_input("Render every N frames", 1, 10, 2, help="Higher number reduces UI lag.")
+    if "run_webcam" not in st.session_state: st.session_state.run_webcam = False
+    def toggle_webcam(): st.session_state.run_webcam = not st.session_state.run_webcam
+    st.button("Toggle Webcam Feed", on_click=toggle_webcam, type="primary")
+    if st.session_state.run_webcam:
+        FRAME_WINDOW, dashboard_cols = st.image([]), st.columns(3)
+        METRIC_PERSONS, METRIC_SAFE, METRIC_UNSAFE = dashboard_cols[0].empty(), dashboard_cols[1].empty(), dashboard_cols[2].empty()
+        CHART_PLACEHOLDER, FPS_PLACEHOLDER, ALERT_PLACEHOLDER = st.empty(), st.empty(), st.empty()
+        predictions_store = {"preds": None, "running": False, "last_request_time": 0}
+        pred_lock, fps_values = threading.Lock(), []
+        def detection_thread_fn(frame_for_detection):
+            with pred_lock:
+                if predictions_store["running"]: return
+                predictions_store["running"] = True
+            preds = detect_ppe(frame_for_detection)
+            with pred_lock:
+                predictions_store["preds"], predictions_store["running"], predictions_store["last_request_time"] = preds, False, time.time()
+        try:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened(): st.error("Cannot open webcam."); st.session_state.run_webcam = False; st.stop()
+            frame_idx, prev_time, last_preds_for_overlay = 0, time.time(), None
+            while st.session_state.run_webcam:
+                ret, frame = cap.read()
+                if not ret: st.warning("Failed to grab frame."); break
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT)); display_frame = frame.copy()
+                with pred_lock: is_busy = predictions_store["running"]
+                if (frame_idx % DETECT_INTERVAL == 0) and not is_busy:
+                    threading.Thread(target=detection_thread_fn, args=(frame.copy(),), daemon=True).start()
+                with pred_lock: preds_json = predictions_store.get("preds")
+                if preds_json:
+                    annotated, preds_list, _ = draw_predictions_on_frame(display_frame.copy(), preds_json)
+                    last_preds_for_overlay = annotated
+                    total_persons, safe_count, unsafe_count, _ = compute_person_ppe_stats(preds_list)
+                    METRIC_PERSONS.metric("Total Persons", total_persons); METRIC_SAFE.metric("✅ Safe", safe_count); METRIC_UNSAFE.metric("❌ Unsafe", unsafe_count)
+                    fig = plot_ppe_pie({"Safe": safe_count, "Unsafe": unsafe_count}); CHART_PLACEHOLDER.pyplot(fig); plt.close(fig)
+                    display_frame = annotated
+                    if unsafe_count > 0:
+                        alert_message = f"⚠️ ALERT: {unsafe_count} unsafe person(s) detected!"
+                        ALERT_PLACEHOLDER.warning(alert_message); send_email_alert(subject="[ACTION REQUIRED] PPE Violation Alert", body=alert_message)
+                    else: ALERT_PLACEHOLDER.empty()
+                elif last_preds_for_overlay is not None: display_frame = last_preds_for_overlay
+                now = time.time(); fps = 1.0 / max(1e-6, (now - prev_time)); prev_time = now
+                fps_values.append(fps);
+                if len(fps_values) > 10: fps_values.pop(0)
+                avg_fps = sum(fps_values) / len(fps_values) if fps_values else 0
+                FPS_PLACEHOLDER.caption(f"Stream FPS: {avg_fps:.1f}")
+                if frame_idx % RENDER_SKIP == 0: FRAME_WINDOW.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+                frame_idx += 1
+        except Exception as e: st.error(f"Webcam stream error: {e}")
+        finally:
+            if 'cap' in locals() and cap.isOpened(): cap.release()
+            st.session_state.run_webcam = False
+    else: st.info("Click the button above to start the live webcam feed.")
+
+# ----------------- VIDEO UPLOAD TAB -----------------
+with tab3:
+    st.header("Upload a Video for Frame-by-Frame Analysis")
+    uploaded_video = st.file_uploader("Choose a video file...", type=["mp4", "mov", "avi", "mkv"])
+
+    if uploaded_video:
+        # Use a temporary file to store the uploaded video
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_video.read())
+        video_path = tfile.name
+
+        # Display the uploaded video
+        st.video(video_path)
+        
+        if st.button("Analyze Video", type="primary"):
+            analysis_results = []
+            results_table = st.empty()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
             try:
-                xyxy = boxes.xyxy.cpu().numpy()
-                cls = boxes.cls.cpu().numpy().astype(int)
-                confs = boxes.conf.cpu().numpy()
-            except Exception:
-                xyxy, cls, confs = [], [], []
+                cap = cv2.VideoCapture(video_path)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                
+                for frame_num in range(total_frames):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-            # For PPE mode, we'll draw person boxes and helmet/jacket boxes in separate colors
-            for (x1, y1, x2, y2), c, conf in zip(xyxy, cls, confs):
-                c = int(c)
-                if mode == "PPE Detection":
-                    if c in helmet_ids:
-                        # Blue box for helmet
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-                        cv2.putText(frame, f"Helmet {conf:.2f}", (int(x1), int(y1)-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 2)
-                    elif c in jacket_ids:
-                        # Yellow box for jacket/vest
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
-                        cv2.putText(frame, f"Jacket {conf:.2f}", (int(x1), int(y1)-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
-                    elif c == 0:
-                        # person
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                else:
-                    # Forbidden Zone logic (same as video)
-                    if int(c) != 0:
-                        continue
-                    x_center = (float(x1) + float(x2)) / 2.0
-                    if xs <= x_center <= xe:
-                        breach_in_frame = True
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-                        ms = cap.get(cv2.CAP_PROP_POS_MSEC)
-                        ts = format_timestamp(ms)
-                        alerts.append({
-                            "frame": frame_no,
-                            "timestamp": ts,
-                            "x_center": int(x_center),
-                            "confidence": float(round(float(conf), 3)),
+                    # Perform detection on the frame
+                    predictions = detect_ppe(frame)
+                    if predictions:
+                        _, preds_list, _ = draw_predictions_on_frame(frame, predictions) # No need for annotated frame here
+                        total_p, safe_c, unsafe_c, _ = compute_person_ppe_stats(preds_list)
+                        
+                        # Store results
+                        analysis_results.append({
+                            'Frame': frame_num + 1,
+                            'Total Persons': total_p,
+                            'Safe Count': safe_c,
+                            'Unsafe Count': unsafe_c
                         })
-                    else:
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                    else: # Handle case where API call fails for a frame
+                         analysis_results.append({
+                            'Frame': frame_num + 1, 'Total Persons': 'N/A', 'Safe Count': 'N/A', 'Unsafe Count': 'N/A'
+                        })
+                    
+                    # Update UI in real-time
+                    progress = (frame_num + 1) / total_frames
+                    progress_bar.progress(progress)
+                    status_text.text(f"Processing frame {frame_num + 1}/{total_frames}...")
+                    
+                    # Display the results table, updating it with each frame
+                    results_df = pd.DataFrame(analysis_results).set_index('Frame')
+                    results_table.dataframe(results_df)
 
-        # Draw forbidden zone overlay if mode is Forbidden Zone
-        if mode == "Forbidden Zone":
-            overlay = frame.copy()
-            cv2.rectangle(overlay, (xs, 0), (xe, h), (0, 0, 255), -1)
-            alpha = 0.12
-            cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+                cap.release()
+                status_text.success("✅ Analysis complete! Generating annotated video...")
 
-        status_text = f"Frame: {frame_no} | Mode: {mode} | Breach: {'YES' if breach_in_frame else 'NO'}"
-        cv2.putText(frame, status_text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                # --- Second pass: Create annotated video ---
+                annotated_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+                cap = cv2.VideoCapture(video_path) # Re-open the video
+                
+                # Get video properties for VideoWriter
+                frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(annotated_video_path, fourcc, fps, (frame_width, frame_height))
 
-        yield frame
+                for frame_num in range(total_frames):
+                    ret, frame = cap.read()
+                    if not ret: break
+                    
+                    # We need to re-run detection to draw boxes
+                    predictions = detect_ppe(frame)
+                    annotated_frame, _, _ = draw_predictions_on_frame(frame, predictions)
+                    out.write(annotated_frame)
+                    progress_bar.progress((frame_num + 1) / total_frames)
 
-    cap.release()
+                cap.release()
+                out.release()
+                
+                status_text.success("✅ Annotated video generated successfully!")
+                progress_bar.empty()
+                
+                st.subheader("🎬 Annotated Video")
+                st.video(annotated_video_path)
+                
+                with open(annotated_video_path, "rb") as file:
+                    st.download_button(
+                        label="Download Annotated Video",
+                        data=file,
+                        file_name="annotated_video.mp4",
+                        mime="video/mp4"
+                    )
 
-
-def save_uploaded_file(uploaded, dest_folder=None) -> str:
-    """Save a Streamlit UploadedFile to disk and return the path."""
-    suffix = os.path.splitext(uploaded.name)[1]
-    if dest_folder is None:
-        dest_folder = tempfile.gettempdir()
-    fd, path = tempfile.mkstemp(suffix=suffix, dir=dest_folder)
-    os.close(fd)
-    with open(path, "wb") as f:
-        f.write(uploaded.getbuffer())
-    return path
-
-
-def main():
-    st.title("Safe-Sight AI: Forbidden Zone Detector")
-
-    st.sidebar.header("Forbidden Zone Settings")
-    # We will present useful, scaled controls after the user uploads a video (so sliders can match frame width).
-    ZONE_X_START = None
-    ZONE_X_END = None
-    st.sidebar.markdown("\nUpload a video and the sidebar will show sliders scaled to the video's width for easy tuning of the forbidden zone.")
-
-    uploaded_video = st.file_uploader("Upload a video (.mp4 or .avi)", type=["mp4", "avi"])
-
-    if uploaded_video is not None:
-        video_path = save_uploaded_file(uploaded_video)
-
-        col1, col2 = st.columns([2, 1])
-        video_placeholder = col1.empty()
-        log_placeholder = col2.empty()
-
-        # Load model (cached)
-        with st.spinner("Loading YOLOv8 model... this may take a moment"):
-            model = load_model()
-
-        alerts = []
-
-        # Stream frames to the UI
-        progress = st.progress(0)
-        total_frames = None
-        try:
-            # Attempt to get total frames for progress and frame width for scaled sliders
-            cap_tmp = cv2.VideoCapture(video_path)
-            if cap_tmp.isOpened():
-                total_frames = int(cap_tmp.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                frame_width = int(cap_tmp.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-            else:
-                frame_width = 0
-            cap_tmp.release()
-        except Exception:
-            total_frames = None
-            frame_width = 0
-
-        # Create sliders scaled to the video's frame width for easier zone selection
-        if frame_width and frame_width > 1:
-            default_start = int(frame_width * 0.25)
-            default_end = int(frame_width * 0.75)
-            ZONE_X_START = st.sidebar.slider("ZONE_X_START (px)", 0, frame_width - 1, default_start, key='zone_start')
-            ZONE_X_END = st.sidebar.slider("ZONE_X_END (px)", 0, frame_width - 1, default_end, key='zone_end')
-        else:
-            # Fallback numeric inputs if width not available
-            ZONE_X_START = st.sidebar.number_input("ZONE_X_START (pixels)", min_value=0, max_value=10000, value=100, step=1)
-            ZONE_X_END = st.sidebar.number_input("ZONE_X_END (pixels)", min_value=0, max_value=10000, value=300, step=1)
-
-        frame_count = 0
-        for frame in process_video(video_path, ZONE_X_START, ZONE_X_END, alerts, model):
-            frame_count += 1
-            # Convert BGR -> RGB for display
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            video_placeholder.image(rgb, channels="RGB", use_column_width=True)
-
-            # Update log view with the most recent alerts
-            if len(alerts) > 0:
-                df = pd.DataFrame(alerts)
-                log_placeholder.dataframe(df.sort_values(by=["frame", "timestamp"], ascending=[True, True]))
-            else:
-                log_placeholder.info("No breaches detected yet.")
-
-            # Update progress if we know total frames
-            if total_frames and total_frames > 0:
-                progress.progress(min(frame_count / max(1, total_frames), 1.0))
-
-            # Let Streamlit breathe between frames
-            time.sleep(0.001)
-
-        progress.empty()
-
-        # Finalized alerts table
-        st.subheader("Breach Alert Log")
-        if len(alerts) > 0:
-            df_final = pd.DataFrame(alerts)
-            st.dataframe(df_final.sort_values(by=["frame", "timestamp"]))
-            csv = df_final.to_csv(index=False).encode("utf-8")
-            st.download_button("Download alerts CSV", csv, file_name="alerts.csv", mime="text/csv")
-        else:
-            st.info("No breaches were detected in the uploaded video.")
-
-        # Cleanup temporary file
-        try:
-            os.remove(video_path)
-        except Exception:
-            pass
-
-
-if __name__ == "__main__":
-    main()
-
-# -----------------------
-# requirements.txt
-# -----------------------
-# The following are the recommended dependencies for this app. Save them into a separate
-# `requirements.txt` when preparing your deployment environment.
-#
-# streamlit
-# ultralytics
-# torch
-# opencv-python
-# numpy
-# pandas
+            except Exception as e:
+                st.error(f"An error occurred during video processing: {e}")
+            finally:
+                # Clean up the temporary files
+                os.remove(video_path)
+                if 'annotated_video_path' in locals() and os.path.exists(annotated_video_path):
+                     os.remove(annotated_video_path)
