@@ -1,0 +1,370 @@
+[1:14 am, 17/10/2025] Arun: ppe-detection-qlq3d-pwdfn/1
+[1:15 am, 17/10/2025] Arun: yU7jc46QBhtWCNQrlT4
+
+
+
+# app.py
+import streamlit as st
+import cv2
+import requests
+from PIL import Image
+from io import BytesIO
+import numpy as np
+from collections import Counter, defaultdict
+import threading
+import time
+import matplotlib.pyplot as plt
+
+# ----------------- PAGE CONFIG -----------------
+st.set_page_config(page_title="PPE Detection System (Roboflow API)", layout="wide")
+st.title("🦺 PPE Detection System (Roboflow API)")
+
+# ----------------- USER INPUT: API KEY & MODEL -----------------
+st.sidebar.header("Roboflow Credentials")
+ROBoflow_API_KEY = st.sidebar.text_input("Roboflow API Key", type="password")
+MODEL_ENDPOINT = st.sidebar.text_input("Roboflow Model Endpoint",
+                                       placeholder="https://detect.roboflow.com/ppe-detection/1")
+
+# Validate basic credentials & URL format before proceeding
+def validate_credentials(api_key: str, url: str):
+    if not api_key or not url:
+        st.sidebar.error("Enter both API key and Model Endpoint.")
+        return False
+    if not url.startswith("https://"):
+        st.sidebar.error("Model Endpoint must start with https://")
+        return False
+    return True
+
+if not validate_credentials(ROBoflow_API_KEY, MODEL_ENDPOINT):
+    st.stop()
+
+# ----------------- SETTINGS -----------------
+st.sidebar.subheader("Detection Settings")
+confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.1, 1.0, 0.45, 0.05)
+selected_classes_input = st.sidebar.text_input("Filter classes (comma separated, leave blank = all)")
+selected_classes = [c.strip() for c in selected_classes_input.split(',') if c.strip()]
+show_boxes = st.sidebar.checkbox("Show Bounding Boxes", value=True)
+
+# Webcam & optimization params (tweak for environment)
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+DETECT_INTERVAL = st.sidebar.number_input("Detect every N frames", min_value=1, max_value=60, value=6)
+FRAME_DIFF_THRESHOLD = st.sidebar.number_input("Frame diff threshold (motion)", min_value=1000, max_value=5000000, value=30000)
+RENDER_SKIP = st.sidebar.number_input("Render every N frames (reduce UI load)", min_value=1, max_value=10, value=2)
+
+# ----------------- HELPER FUNCTIONS -----------------
+def detect_ppe(frame: np.ndarray, timeout=10):
+    """
+    Send a 640x480 BGR frame to Roboflow and return JSON predictions.
+    Returns None on error.
+    """
+    try:
+        # Ensure expected size
+        img = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        buf = BytesIO()
+        pil_img.save(buf, format="JPEG")
+        buf.seek(0)
+
+        response = requests.post(
+            MODEL_ENDPOINT,
+            params={"api_key": ROBoflow_API_KEY},
+            files={"file": buf.getvalue()},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as he:
+        st.error(f"Roboflow HTTP error: {he}")
+        return None
+    except requests.exceptions.ConnectionError as ce:
+        st.error(f"Network error: {ce}")
+        return None
+    except requests.exceptions.Timeout:
+        st.warning("Roboflow request timed out.")
+        return None
+    except Exception as e:
+        st.error(f"Detection error: {e}")
+        return None
+
+def draw_predictions_on_frame(frame: np.ndarray, predictions: dict):
+    """
+    Draw bounding boxes and labels on frame safely.
+    Returns (frame, preds_list, classes_list)
+    """
+    preds_list = []
+    if not predictions or "predictions" not in predictions:
+        return frame, preds_list, []
+
+    for pred in predictions["predictions"]:
+        try:
+            cls = str(pred.get("class", "unknown"))
+            conf = float(pred.get("confidence", 0.0))
+            if np.isnan(conf) or conf < confidence_threshold:
+                continue
+            if selected_classes and cls not in selected_classes:
+                continue
+
+            # Get coordinates safely
+            x_c = float(pred.get("x", 0))
+            y_c = float(pred.get("y", 0))
+            w = float(pred.get("width", 0))
+            h = float(pred.get("height", 0))
+
+            # Skip invalid boxes
+            if any(map(lambda v: np.isnan(v) or v <= 0, [x_c, y_c, w, h])):
+                continue
+
+            x1 = int(round(x_c - w / 2))
+            y1 = int(round(y_c - h / 2))
+            x2 = int(round(x_c + w / 2))
+            y2 = int(round(y_c + h / 2))
+
+            # Clip coordinates to frame size
+            h_img, w_img = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_img - 1, x2), min(h_img - 1, y2)
+
+            preds_list.append({
+                "class": cls,
+                "conf": conf,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2
+            })
+
+            if show_boxes:
+                color = (0, 255, 0)
+                if cls.lower().startswith("no_") or cls.lower().startswith("missing"):
+                    color = (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame, f"{cls} {conf:.2f}", (x1, max(15, y1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 2
+                )
+
+        except Exception as e:
+            # Gracefully skip bad prediction
+            print(f"Skipping invalid prediction: {e}")
+            continue
+
+    classes = [p["class"] for p in preds_list]
+    return frame, preds_list, classes
+def convert_to_bytes(frame: np.ndarray):
+    pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    buf = BytesIO()
+    pil_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+def compute_person_ppe_stats(preds_list):
+    """
+    Associate detected helmets/jackets with person boxes using simple spatial containment.
+    Returns:
+        total_persons (int), safe_count (int), unsafe_count (int), per_person_status (list)
+    per_person_status = [{'person_box': (x1,y1,x2,y2), 'has_helmet':bool, 'has_jacket':bool}, ...]
+    """
+    persons = [p for p in preds_list if p["class"].lower() == "person"]
+    helmets = [p for p in preds_list if "helmet" in p["class"].lower() and not p["class"].lower().startswith("no_")]
+    jackets = [p for p in preds_list if ("jacket" in p["class"].lower() or "safety" in p["class"].lower() or "vest" in p["class"].lower()) and not p["class"].lower().startswith("no_")]
+
+    # There may be "no_helmet" or "no_jacket" classes; treat them as negatives
+    no_helmets = [p for p in preds_list if p["class"].lower().startswith("no_") and "helmet" in p["class"].lower()]
+    no_jackets = [p for p in preds_list if p["class"].lower().startswith("no_") and ("jacket" in p["class"].lower() or "vest" in p["class"].lower())]
+
+    per_person = []
+    for person in persons:
+        x1, y1, x2, y2 = person["x1"], person["y1"], person["x2"], person["y2"]
+        has_helmet = False
+        has_jacket = False
+
+        # check helmet centers in person bbox
+        for h in helmets:
+            cx = (h["x1"] + h["x2"]) // 2
+            cy = (h["y1"] + h["y2"]) // 2
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                has_helmet = True
+                break
+
+        for j in jackets:
+            cx = (j["x1"] + j["x2"]) // 2
+            cy = (j["y1"] + j["y2"]) // 2
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                has_jacket = True
+                break
+
+        # If explicit "no_helmet" inside bbox, mark no helmet
+        for nh in no_helmets:
+            cx = (nh["x1"] + nh["x2"]) // 2
+            cy = (nh["y1"] + nh["y2"]) // 2
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                has_helmet = False
+
+        for nj in no_jackets:
+            cx = (nj["x1"] + nj["x2"]) // 2
+            cy = (nj["y1"] + nj["y2"]) // 2
+            if x1 <= cx <= x2 and y1 <= cy <= y2:
+                has_jacket = False
+
+        per_person.append({"person_box": (x1, y1, x2, y2), "has_helmet": has_helmet, "has_jacket": has_jacket})
+
+    total_persons = len(per_person)
+    safe_count = sum(1 for p in per_person if p["has_helmet"] and p["has_jacket"])
+    unsafe_count = total_persons - safe_count
+    return total_persons, safe_count, unsafe_count, per_person
+
+def plot_ppe_pie(stats_dict):
+    """Return matplotlib fig for given stats dict {'Safe':n, 'Unsafe':m}"""
+    labels = list(stats_dict.keys())
+    sizes = list(stats_dict.values())
+    fig, ax = plt.subplots()
+    ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90)
+    ax.axis('equal')
+    return fig
+
+# ----------------- IMAGE UPLOAD DETECTION -----------------
+st.subheader("📷 Image Upload Detection")
+uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"], key="image_upload")
+if uploaded_file is not None:
+    image = Image.open(uploaded_file).convert("RGB")
+    frame = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    # send a copy for detection (resized in detect_ppe)
+    predictions = detect_ppe(frame)
+    if predictions:
+        annotated_frame, preds_list, classes = draw_predictions_on_frame(frame.copy(), predictions)
+        st.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+        st.download_button("Download Annotated Image", data=convert_to_bytes(annotated_frame),
+                           file_name="annotated_image.png", mime="image/png")
+        counts = Counter(classes)
+        st.subheader("PPE Counts")
+        cols = st.columns(3)
+        cols[0].metric("Persons", counts.get("person", 0))
+        cols[1].metric("Helmets", counts.get("helmet", 0) + counts.get("hard_hat", 0))
+        cols[2].metric("Jackets/Vests", counts.get("safety_jacket", 0) + counts.get("vest", 0))
+        # Compute per-person compliance
+        total_persons, safe_count, unsafe_count, per_person = compute_person_ppe_stats(preds_list)
+        st.write(f"Total persons: {total_persons} — Safe: {safe_count} — Unsafe: {unsafe_count}")
+        fig = plot_ppe_pie({"Safe": safe_count, "Unsafe": unsafe_count})
+        st.pyplot(fig)
+
+# ----------------- LIVE WEBCAM DETECTION (Optimized + PPE Pie Chart) -----------------
+st.subheader("🎥 Live Webcam Detection (High FPS + PPE Analysis)")
+run = st.checkbox("Run Webcam Detection", value=False, key="run_webcam")
+FRAME_WINDOW = st.image(np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8))
+PPE_COUNT_PLACEHOLDER = st.empty()
+METRIC_COLS = st.columns(3)
+CHART_PLACEHOLDER = st.empty()
+FPS_PLACEHOLDER = st.empty()
+
+# Thread-safe storage
+predictions_store = {"preds": None}
+pred_lock = threading.Lock()
+
+def detection_thread_fn(frame_for_detection):
+    """Call detect_ppe and store results (threaded)"""
+    preds = detect_ppe(frame_for_detection)
+    with pred_lock:
+        predictions_store["preds"] = preds
+
+if run:
+    try:
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # use DirectShow on Windows; harmless elsewhere
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        if not cap.isOpened():
+            st.error("Cannot open webcam. Check camera access permissions.")
+            st.session_state["run_webcam"] = False
+            st.stop()
+
+        frame_idx = 0
+        prev_gray = None
+        prev_time = time.time()
+        last_stats = {"Safe": 0, "Unsafe": 0}
+        last_preds_for_overlay = None
+
+        # Warm-start: trigger initial detection
+        threading.Thread(target=detection_thread_fn, args=(np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8),), daemon=True).start()
+
+        while st.session_state.get("run_webcam", False):
+            ret, frame = cap.read()
+            if not ret:
+                st.warning("Failed to read frame from webcam")
+                break
+
+            # Ensure frame is our chosen size
+            if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+
+            display_frame = frame.copy()
+
+            # motion detection (grayscale diff)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            send_to_api = False
+
+            if prev_gray is not None:
+                diff = cv2.absdiff(prev_gray, gray)
+                diff_score = int(np.sum(diff))
+                if diff_score > FRAME_DIFF_THRESHOLD:
+                    send_to_api = True
+            # also ensure a detection every DETECT_INTERVAL frames
+            if frame_idx % DETECT_INTERVAL == 0:
+                send_to_api = True
+
+            if send_to_api and (not threading.active_count() > 20):
+                # spawn a detection thread (frame copy)
+                threading.Thread(target=detection_thread_fn, args=(frame.copy(),), daemon=True).start()
+
+            prev_gray = gray
+            frame_idx += 1
+
+            # Overlay latest predictions (thread-safe read)
+            with pred_lock:
+                preds_json = predictions_store.get("preds")
+
+            if preds_json:
+                annotated, preds_list, classes = draw_predictions_on_frame(display_frame.copy(), preds_json)
+                last_preds_for_overlay = annotated
+                # compute person/ppe stats
+                total_persons, safe_count, unsafe_count, per_person = compute_person_ppe_stats(preds_list)
+                last_stats = {"Safe": safe_count, "Unsafe": unsafe_count}
+
+                # show metrics (use separate columns to avoid re-rendering heavy image)
+                METRIC_COLS[0].metric("Persons", total_persons)
+                METRIC_COLS[1].metric("Safe (helmet+vest)", safe_count)
+                METRIC_COLS[2].metric("Unsafe", unsafe_count)
+
+                # pie chart update (re-create)
+                fig = plot_ppe_pie(last_stats)
+                CHART_PLACEHOLDER.pyplot(fig)
+                plt.close(fig)
+
+                # Use annotated for display
+                display_frame = annotated
+
+            else:
+                # show last overlay if available while waiting for new preds
+                if last_preds_for_overlay is not None:
+                    display_frame = last_preds_for_overlay
+
+            # FPS calc
+            now = time.time()
+            fps = 1.0 / max(1e-6, (now - prev_time))
+            prev_time = now
+            FPS_PLACEHOLDER.text(f"FPS: {fps:.1f}")
+
+            # Draw FPS on frame for optional debugging
+            cv2.putText(display_frame, f"FPS: {fps:.1f}", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+
+            # Only render to streamlit every RENDER_SKIP frames to reduce UI cost
+            if frame_idx % RENDER_SKIP == 0:
+                FRAME_WINDOW.image(cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB))
+
+        # release camera once done
+        if cap.isOpened():
+            cap.release()
+
+    except Exception as e:
+        st.error(f"Webcam error: {e}")
+    finally:
+        if 'cap' in locals() and cap.isOpened():
+            cap.release()
+        st.session_state["run_webcam"] = False
+
+# End of app
